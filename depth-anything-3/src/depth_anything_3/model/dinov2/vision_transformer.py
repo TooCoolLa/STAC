@@ -666,3 +666,13 @@ def get_kv_mgr_info(self):
     return {}
 
 DinoVisionTransformer.get_kv_mgr_info = get_kv_mgr_info
+
+
+def set_camhead(self, status: bool):
+    """
+    Set camera head status (no-op for DA3, kept for API compatibility with STAC).
+    DA3 predicts camera poses directly through the backbone, not via a separate head.
+    """
+    pass  # DA3 doesn't have a separate camera head
+
+DinoVisionTransformer.set_camhead = set_camhead

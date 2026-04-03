@@ -36,7 +36,8 @@ model_wrappers = {
 }
 
 stream_sessions = {
-    "causalvggt": StreamSession
+    "causalvggt": StreamSession,
+    "da3": StreamSession,  # DA3 uses the same StreamSession with model_type="da3"
 }
 
 def _load_checkpoint(ckpt_path):

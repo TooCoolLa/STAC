@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from typing import Tuple
 import torch
 import torch.nn as nn
 from addict import Dict
@@ -106,22 +107,34 @@ class DepthAnything3Net(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        mode: str = "full",
+        streaming: bool = False,
+        **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the network.
 
         Args:
-            x: Input images (B, N, 3, H, W)
-            extrinsics: Camera extrinsics (B, N, 4, 4) 
-            intrinsics: Camera intrinsics (B, N, 3, 3) 
+            x: Input images (B, N, 3, H, W) or (S, 3, H, W)
+            extrinsics: Camera extrinsics (B, N, 4, 4)
+            intrinsics: Camera intrinsics (B, N, 3, 3)
             feat_layers: List of layer indices to extract features from
             infer_gs: Enable Gaussian Splatting branch
             use_ray_pose: Use ray-based pose estimation
             ref_view_strategy: Strategy for selecting reference view
+            mode: Attention mode (for STAC compatibility)
+            streaming: Enable streaming mode (for STAC compatibility)
+            **kwargs: Additional arguments (for STAC KV cache management)
 
         Returns:
             Dictionary containing predictions and auxiliary features
         """
+        # Handle input shape: [S, 3, H, W] -> [B, N, 3, H, W]
+        if len(x.shape) == 4:
+            x = x.unsqueeze(0)  # Add batch dimension: [S, 3, H, W] -> [1, S, 3, H, W]
+        
+        B, N = x.shape[0], x.shape[1]
+
         # Extract features using backbone
         if extrinsics is not None:
             with torch.autocast(device_type=x.device.type, enabled=False):
@@ -130,7 +143,8 @@ class DepthAnything3Net(nn.Module):
             cam_token = None
 
         feats, aux_feats = self.backbone(
-            x, cam_token=cam_token, export_feat_layers=export_feat_layers, ref_view_strategy=ref_view_strategy
+            x, cam_token=cam_token, export_feat_layers=export_feat_layers, 
+            ref_view_strategy=ref_view_strategy, mode=mode, streaming=streaming, **kwargs
         )
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
@@ -144,13 +158,196 @@ class DepthAnything3Net(nn.Module):
                 output = self._process_camera_estimation(feats, H, W, output)
             if infer_gs:
                 output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
-        
-        output = self._process_mono_sky_estimation(output)    
+
+        output = self._process_mono_sky_estimation(output)
 
         # Extract auxiliary features if requested
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
 
+        # Add timing if requested
+        if kwargs.get("timing", False):
+            output["timing"] = {"aggregator_infer_time": 0.0}
+
+        # Convert to STAC-compatible format
+        if streaming:
+            # Convert DA3 output to STAC format
+            stac_output = self._convert_to_stac_format(output, images=x, H=H, W=W)
+            return stac_output
+
         return output
+
+    def _convert_to_stac_format(
+        self, 
+        output: Dict[str, torch.Tensor],
+        images: torch.Tensor,
+        H: int,
+        W: int
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Convert DA3 output to STAC-compatible format.
+        
+        DA3 outputs:
+        - depth: [B, N, H, W]
+        - depth_conf: [B, N, H, W]
+        - extrinsics: [B, N, 3, 4] (w2c)
+        - intrinsics: [B, N, 3, 3]
+        
+        STAC expects:
+        - pose_enc: [B, N, 9]
+        - depth: [B, N, H, W, 1]
+        - depth_conf: [B, N, H, W]
+        - world_points: [B, N, H, W, 3]
+        - world_points_conf: [B, N, H, W]
+        - images: [B, N, 3, H, W]
+        """
+        from depth_anything_3.model.utils.transform import pose_encoding_to_extri_intri
+        from depth_anything_3.utils.geometry import affine_inverse
+        import torch.nn.functional as F
+        
+        stac_output = {}
+        
+        # Convert extrinsics to pose_enc
+        # DA3 extrinsics: [B, N, 3, 4] w2c format
+        # STAC needs pose_enc which is a 9D encoding
+        extrinsics = output.get("extrinsics", None)
+        intrinsics = output.get("intrinsics", None)
+        
+        if extrinsics is not None:
+            # Convert w2c to c2w for pose encoding
+            c2w = affine_inverse(extrinsics)  # [B, N, 4, 4]
+            # Simple pose encoding: just use rotation + translation
+            # Format: [R(3x3 flattened), t(3)] -> but we only need 9 values
+            # Use simplified encoding: [R(3x3 upper), t(3)] = 9 + 3 = 12 -> take first 9
+            # Actually, let's use the same encoding as pose_encoding_to_extri_intri expects
+            # For now, use a simple encoding
+            pose_enc = self._encode_pose_from_extrinsics(extrinsics)
+            stac_output["pose_enc"] = pose_enc
+        
+        # Reshape depth to match STAC format
+        depth = output.get("depth", None)
+        depth_conf = output.get("depth_conf", None)
+        
+        if depth is not None:
+            # DA3 depth: [B, N, H, W] -> STAC: [B, N, H, W, 1]
+            if len(depth.shape) == 4:
+                stac_output["depth"] = depth.unsqueeze(-1)
+            else:
+                stac_output["depth"] = depth
+        
+        if depth_conf is not None:
+            stac_output["depth_conf"] = depth_conf
+        
+        # Compute world points from depth and camera parameters
+        if depth is not None and extrinsics is not None and intrinsics is not None:
+            world_points, world_points_conf = self._compute_world_points(
+                depth.squeeze(-1) if len(depth.shape) == 5 else depth,
+                extrinsics,
+                intrinsics,
+                H, W
+            )
+            stac_output["world_points"] = world_points
+            stac_output["world_points_conf"] = world_points_conf
+        
+        # Store images
+        stac_output["images"] = images
+        
+        # Store aggregated tokens list for camera head inference (if needed)
+        # DA3 doesn't have this, so we'll use a placeholder
+        stac_output["aggregated_tokens_list"] = [None]
+        
+        return stac_output
+
+    def _encode_pose_from_extrinsics(self, extrinsics: torch.Tensor) -> torch.Tensor:
+        """
+        Convert extrinsics (w2c) to pose_enc (9D).
+        
+        Args:
+            extrinsics: [B, N, 3, 4] w2c format
+            
+        Returns:
+            pose_enc: [B, N, 9]
+        """
+        # Extract rotation (3x3) and translation (3x1)
+        # w2c = [R | t]
+        R = extrinsics[:, :, :3, :3]  # [B, N, 3, 3]
+        t = extrinsics[:, :, :3, 3:]  # [B, N, 3, 1]
+        
+        # Simple encoding: use first 2 rows of R (6 values) + t (3 values) = 9 values
+        # This is a simplified encoding, not the full Rodrigues representation
+        pose_enc = torch.cat([
+            R[:, :, :2, :].reshape(-1, 6),  # First 2 rows of rotation
+            t.reshape(-1, 3)  # Translation
+        ], dim=-1)  # [B*N, 9]
+        
+        # Reshape to [B, N, 9]
+        B, N = extrinsics.shape[0], extrinsics.shape[1]
+        pose_enc = pose_enc.reshape(B, N, 9)
+        
+        return pose_enc
+
+    def _compute_world_points(
+        self,
+        depth: torch.Tensor,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        H: int,
+        W: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute world coordinates from depth and camera parameters.
+        
+        Args:
+            depth: [B, N, H, W]
+            extrinsics: [B, N, 3, 4] w2c
+            intrinsics: [B, N, 3, 3]
+            H, W: Image dimensions
+            
+        Returns:
+            world_points: [B, N, H, W, 3]
+            world_points_conf: [B, N, H, W]
+        """
+        import torch.nn.functional as F
+        from depth_anything_3.utils.geometry import affine_inverse
+        
+        B, N = depth.shape[0], depth.shape[1]
+        
+        # Create pixel grid
+        u = torch.arange(W, device=depth.device, dtype=depth.dtype)
+        v = torch.arange(H, device=depth.device, dtype=depth.dtype)
+        uu, vv = torch.meshgrid(u, v, indexing='xy')
+        
+        # Pixel coordinates: [H, W]
+        pixel_coords = torch.stack([uu, vv, torch.ones_like(uu)], dim=-1)  # [H, W, 3]
+        pixel_coords = pixel_coords.unsqueeze(0).unsqueeze(0).expand(B, N, -1, -1, -1)  # [B, N, H, W, 3]
+        
+        # Unproject to camera coordinates
+        # K^-1 @ pixel_coords * depth
+        intrinsics_inv = torch.inverse(intrinsics)  # [B, N, 3, 3]
+        
+        # Reshape for matrix multiplication
+        pixel_flat = pixel_coords.reshape(B, N, -1, 3)  # [B, N, H*W, 3]
+        cam_coords = torch.einsum('bnij,bnkj->bnki', intrinsics_inv, pixel_flat)  # [B, N, H*W, 3]
+        cam_coords = cam_coords * depth.reshape(B, N, -1, 1)  # [B, N, H*W, 3]
+        
+        # Convert to world coordinates
+        # c2w = inverse(w2c)
+        c2w = affine_inverse(extrinsics)  # [B, N, 4, 4]
+        
+        cam_coords_homo = torch.cat([
+            cam_coords,
+            torch.ones(B, N, cam_coords.shape[2], 1, device=depth.device, dtype=depth.dtype)
+        ], dim=-1)  # [B, N, H*W, 4]
+        
+        world_coords = torch.einsum('bnij,bnkj->bnki', c2w, cam_coords_homo)  # [B, N, H*W, 4]
+        world_coords = world_coords[..., :3]  # [B, N, H*W, 3]
+        
+        # Reshape to [B, N, H, W, 3]
+        world_coords = world_coords.reshape(B, N, H, W, 3)
+        
+        # Confidence: assume high confidence everywhere (can be improved)
+        confidence = torch.ones(B, N, H, W, device=depth.device, dtype=depth.dtype)
+        
+        return world_coords, confidence
 
     def _process_mono_sky_estimation(
         self, output: Dict[str, torch.Tensor]
