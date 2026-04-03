@@ -12,15 +12,27 @@ logger = logging.getLogger("model wrapper")
 from stream_session import StreamSession
 from causalvggt.models.vggt import CausalVGGT
 
+# DA3 imports (for STAC integration)
+import sys
+sys.path.insert(0, os.path.join(root_dir, "depth-anything-3", "src"))
+from depth_anything_3.api import DepthAnything3
+
 ckpt_root = os.path.join(root_dir, 'ckpt')
 
 model_paths = {
     "stream3r": os.path.join(ckpt_root, 'stream3r'),
     "streamvggt": os.path.join(ckpt_root, 'streamvggt'),
+    # DA3 models
+    "da3-small": os.path.join(ckpt_root, 'da3', 'DA3-SMALL'),
+    "da3-base": os.path.join(ckpt_root, 'da3', 'DA3-BASE'),
+    "da3-large": os.path.join(ckpt_root, 'da3', 'DA3-LARGE-1.1'),
+    "da3-giant": os.path.join(ckpt_root, 'da3', 'DA3-GIANT-1.1'),
+    "da3nested-giant-large": os.path.join(ckpt_root, 'da3', 'DA3NESTED-GIANT-LARGE-1.1'),
 }
 
 model_wrappers = {
     "causalvggt": CausalVGGT,
+    "da3": DepthAnything3,
 }
 
 stream_sessions = {
@@ -69,11 +81,34 @@ def _safe_load_state_dict(model, ckpt):
                      f"(unused heads): {result.unexpected_keys[:5]}{'...' if len(result.unexpected_keys) > 5 else ''}")
 
 def load_model(model_name, base_model='stream3r', device='cuda', model_path=None):
-    if model_name != "causalvggt":
-        raise ValueError(f"Unsupported model_name '{model_name}'. Only 'causalvggt' is supported.")
+    if model_name not in model_wrappers:
+        raise ValueError(f"Unsupported model_name '{model_name}'. Choose from: {list(model_wrappers.keys())}")
     if base_model not in model_paths:
         raise ValueError(f"Unsupported base_model '{base_model}'. Choose from: {list(model_paths.keys())}")
 
+    # DA3 uses HuggingFace-style loading
+    if model_name == "da3":
+        ckpt_source = model_path if model_path is not None else model_paths[base_model]
+        # DA3 loads from HuggingFace hub or local directory
+        try:
+            model = model_wrappers[model_name].from_pretrained(ckpt_source)
+        except Exception:
+            # Fallback: load from config and weights manually
+            from depth_anything_3.cfg import create_object, load_config
+            config = load_config(base_model)
+            model = create_object(config)
+            if os.path.isdir(ckpt_source):
+                weight_path = os.path.join(ckpt_source, "model.safetensors")
+                if os.path.exists(weight_path):
+                    from safetensors.torch import load_file
+                    model.load_state_dict(load_file(weight_path), strict=False)
+        model.model.eval()
+        model = model.to(device)
+        model.device = device
+        logger.info(f"Loaded DA3 model: {base_model} from {ckpt_source}")
+        return model
+
+    # CausalVGGT loading
     model = model_wrappers[model_name](base_model=base_model)
     ckpt_source = model_path if model_path is not None else model_paths[base_model]
     ckpt = _load_checkpoint(ckpt_source)
@@ -94,11 +129,11 @@ STAC_DEFAULTS = {
 }
 
 def run_model(model, images, model_name, mode='full',
-              streaming=False, dtype=torch.bfloat16, device='cuda', 
+              streaming=False, dtype=torch.bfloat16, device='cuda',
               **kwargs
               ):
-    if model_name != "causalvggt":
-        raise NotImplementedError(f"Model '{model_name}' not supported. Only 'causalvggt' is supported.")
+    if model_name not in model_wrappers:
+        raise NotImplementedError(f"Model '{model_name}' not supported. Choose from: {list(model_wrappers.keys())}")
 
     # Keep user-facing mode so multi-scene eval (launch.py) does not overwrite args.mode
     # with the expanded internal mode and break the next scene (e.g. window_size would stay 0).
@@ -116,13 +151,13 @@ def run_model(model, images, model_name, mode='full',
 
     processed_frames = images.shape[0]
     if streaming:
-        logger.info("Using streaming mode for CausalVGGT.")
+        logger.info("Using streaming mode for %s.", model_name)
         if mode == "full":
             logger.warning("Warning: you are trying to use 'full' attention mode with streaming, which will cause high memory usage.")
         cam_cache_update = kwargs.get("cam_cache_update", False)
         kwargs.pop("cam_cache_update", None)
-        session: StreamSession = stream_sessions[model_name](
-            model, device=device, cam_cache_update=cam_cache_update)
+        session: StreamSession = stream_sessions.get(model_name, StreamSession)(
+            model, device=device, cam_cache_update=cam_cache_update, model_type=model_name)
 
         session.pipeline(images, mode=mode,
                          dtype=dtype, device=device,

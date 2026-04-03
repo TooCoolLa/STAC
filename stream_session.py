@@ -62,20 +62,30 @@ def _gpu_mem_mb():
 
 class StreamSession:
     """
-    A causal streaming inference session with KV cache management for CausalVGGT.
+    A causal streaming inference session with KV cache management for CausalVGGT or DA3.
     """
 
     def __init__(
         self,
-        model: CausalVGGT,
+        model,
         cam_cache_update: bool = False,
         device: torch.device = torch.device("cuda"),
+        model_type: str = "causalvggt",
     ):
+        self.model_type = model_type
         self.model = model.to(device)
         self.device = device
-        self.aggregator_kv_cache_depth = model.aggregator.depth
-        self.camera_head_kv_cache_depth = model.camera_head.trunk_depth if model.camera_head is not None else 0
-        self.camera_head_iterations = 4 if model.camera_head is not None else 0
+
+        if model_type == "da3":
+            # DA3 uses backbone as the aggregator
+            self.aggregator = model.model.backbone.pretrained
+        else:
+            # CausalVGGT uses dedicated aggregator
+            self.aggregator = model.aggregator
+
+        self.aggregator_kv_cache_depth = self.aggregator.depth if hasattr(self.aggregator, 'depth') else 24
+        self.camera_head_kv_cache_depth = model.camera_head.trunk_depth if hasattr(model, 'camera_head') and model.camera_head is not None else 0
+        self.camera_head_iterations = 4 if hasattr(model, 'camera_head') and model.camera_head is not None else 0
         self.cam_cache_update = cam_cache_update
         self.pose_tokens_list = []
         # Prediction keys to track, where the element of prediction shape like [B, S, ...]
@@ -93,7 +103,10 @@ class StreamSession:
 
     def clear(self):
         self._clear_predictions()
-        self.model.aggregator.clear_kv_mgr()
+        if hasattr(self.model, 'aggregator') and self.model.aggregator is not None:
+            self.model.aggregator.clear_kv_mgr()
+        elif hasattr(self.aggregator, 'clear_kv_mgr'):
+            self.aggregator.clear_kv_mgr()
         torch.cuda.empty_cache()
         self.pose_tokens_list = []
         self._processed_frames = 0
@@ -305,7 +318,10 @@ class StreamSession:
                 "chunk_size": chunk_size,
             })
             kv_kwargs = self.register_kv_mgr(mode, images, KVManager, **kv_kwargs)
-            self.model.set_camhead(self.cam_cache_update)
+            if self.model_type == "da3":
+                self.model.model.backbone.pretrained.set_camhead(self.cam_cache_update)
+            else:
+                self.model.set_camhead(self.cam_cache_update)
             debug_timing = kwargs.get("timing", True)
             logger.info("Window mode: chunk=%d, transfer_chunk=%d, window=%d",
                         chunk_size, transfer_chunk_size, window_size)
@@ -341,7 +357,9 @@ class StreamSession:
                         self.pushback_prediction(outputs)
                         self._update_benchmark(outputs.get("timing", {}))
 
-                        kvcache_info = self.model.aggregator.get_kv_mgr_info()
+                        kvcache_info = (self.model.aggregator.get_kv_mgr_info()
+                                        if hasattr(self.model, 'aggregator')
+                                        else self.model.model.backbone.pretrained.get_kv_mgr_info())
                         kvcache_size = kvcache_info["kvcache_size"][0]
                         kvcache_mem = kvcache_info["kvcache_used"]
                         # When CPU offload is active, show total (gpu+cpu) so stats reflect full context
@@ -371,7 +389,10 @@ class StreamSession:
             if VERBOSE:
                 logger.info("Window mode done.")
             # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
-            kv_mgr = self.model.aggregator.kv_manager
+            if self.model_type == "da3":
+                kv_mgr = self.model.model.backbone.pretrained.kv_manager
+            else:
+                kv_mgr = self.model.aggregator.kv_manager
             if kv_mgr is not None:
                 metrics = {"Token": {}}
                 if hasattr(kv_mgr, "get_memory_details"):
@@ -419,13 +440,19 @@ class StreamSession:
             }
             kv_kwargs.update(merger_kwargs)
             kv_kwargs = self.register_kv_mgr(mode, images, STACVoxelKV, **kv_kwargs)
-            kv_manager = self.model.aggregator.kv_manager
+            if self.model_type == "da3":
+                kv_manager = self.model.model.backbone.pretrained.kv_manager
+            else:
+                kv_manager = self.model.aggregator.kv_manager
 
             window_size = kv_kwargs.get("recent_size", 0)
             ret_size = kv_kwargs.get("retrieval_size", -1)
             buffer_size = kv_kwargs.get("buffer_size", 16)
 
-            self.model.set_camhead(self.cam_cache_update)
+            if self.model_type == "da3":
+                pass  # DA3 doesn't have set_camhead
+            else:
+                self.model.set_camhead(self.cam_cache_update)
 
             conf_threshold = kwargs.get("conf_threshold", 2.0)
             transfer_chunk_size = kwargs.get("transfer_chunk_size", max(chunk_size, 16))
@@ -437,7 +464,9 @@ class StreamSession:
                 transfer_chunk_size = chunk_size
             logger.info("STAC chunk-merge: chunk=%d, transfer_chunk=%d, window=%d, conf_threshold=%.1f",
                         chunk_size, transfer_chunk_size, window_size, conf_threshold)
-            special_tokens_size = self.model.aggregator.patch_start_idx
+            special_tokens_size = (self.model.aggregator.patch_start_idx
+                                   if hasattr(self.model, 'aggregator')
+                                   else self.model.model.backbone.pretrained.patch_start_idx)
             
             progress, task = _make_progress("STAC Mode", num_frames)
             with Live(progress, console=_console, refresh_per_second=8) as live:
@@ -468,11 +497,14 @@ class StreamSession:
                         else:
                             pose_enc = outputs["pose_enc"]
 
-                        pts3d, valid_mask = self.get_pointmap(outputs, conf_threshold=conf_threshold, 
+                        pts3d, valid_mask = self.get_pointmap(outputs, conf_threshold=conf_threshold,
                                                               special_tokens_size=special_tokens_size,
                                                               pose_enc = pose_enc, images=frame_buffer
                                                               )
-                        kv_pos_time = self.model.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
+                        if self.model_type == "da3":
+                            kv_pos_time = self.model.model.backbone.pretrained.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
+                        else:
+                            kv_pos_time = self.model.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
                         timing["kv_position_time"] = kv_pos_time
 
                         retrieval_time = 0.0
@@ -480,17 +512,31 @@ class StreamSession:
                             if ret_size > 0:
                                 chunks_per_window = max(1, window_size // chunk_size)
                                 if (frame_idx // chunk_size + 1) % chunks_per_window == 0:
-                                    retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                    if self.model_type == "da3":
+                                        retrieval_time = self.model.model.backbone.pretrained.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                                                                           dist_thres=dist_thres,
+                                                                                           return_buf=kwargs.get("return_buf", False))
+                                    else:
+                                        retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
                                                                                            dist_thres=dist_thres,
                                                                                            return_buf=kwargs.get("return_buf", False))
                             elif ret_size == -1:
-                                retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                if self.model_type == "da3":
+                                    retrieval_time = self.model.model.backbone.pretrained.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                                                                       dist_thres=dist_thres,
+                                                                                       return_buf=kwargs.get("return_buf", False))
+                                else:
+                                    retrieval_time = self.model.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
                                                                                        dist_thres=dist_thres,
                                                                                        return_buf=kwargs.get("return_buf", False))
 
                         timing["kv_retrieval_time"] = retrieval_time
 
-                        evict_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
+                        evict_merge_time = 0.0
+                        if self.model_type == "da3":
+                            evict_merge_time = self.model.model.backbone.pretrained.prune_kv_mgr(timing=debug_timing)
+                        else:
+                            evict_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
                         timing["kv_evict_merge_time"] = evict_merge_time
 
                         if frame_idx % (chunk_size * 4) == 0 or frame_idx >= num_frames - chunk_size:
@@ -517,7 +563,9 @@ class StreamSession:
                         self.pushback_prediction(outputs)
                         self._update_benchmark(timing)
 
-                        kvcache_info = self.model.aggregator.get_kv_mgr_info()
+                        kvcache_info = (self.model.aggregator.get_kv_mgr_info()
+                                        if hasattr(self.model, 'aggregator')
+                                        else self.model.model.backbone.pretrained.get_kv_mgr_info())
                         merger_stat = kv_manager.get_merger_info()
                         merger_stat["frame_idx"] = frame_idx
                         total_time = 0.0
@@ -557,7 +605,10 @@ class StreamSession:
                 logger.info("STAC chunk-merge mode done.")
 
             # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
-            kv_mgr = self.model.aggregator.kv_manager
+            if self.model_type == "da3":
+                kv_mgr = self.model.model.backbone.pretrained.kv_manager
+            else:
+                kv_mgr = self.model.aggregator.kv_manager
             if kv_mgr is not None:
                 metrics = {"hyperparameters": merger_kwargs, "Token": {}}
                 if hasattr(kv_mgr, "get_memory_details"):
