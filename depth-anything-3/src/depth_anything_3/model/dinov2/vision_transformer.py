@@ -480,7 +480,7 @@ class DinoVisionTransformer(nn.Module):
                 if x.shape[1] >= THRESH_FOR_REF_SELECTION and self.alt_start != -1 and 'b_idx' in locals():
                     out_x = restore_original_order(out_x, b_idx)
                 output.append((out_x[:, :, 0], out_x))
-            if i in export_feat_layers:
+            if export_feat_layers is not None and i in export_feat_layers:
                 aux_output.append(x)
         return output, aux_output
 
@@ -631,7 +631,10 @@ DinoVisionTransformer.clear_kv_mgr = clear_kv_mgr
 def prune_kv_mgr(self, timing=False):
     """Prune the KV manager cache."""
     if self.kv_manager is not None:
-        return self.kv_manager.prune_kv(timing=timing)
+        import time
+        start = time.time()
+        self.kv_manager.prune_kv()
+        return (time.time() - start) * 1000 if timing else 0.0
     return 0.0
 
 DinoVisionTransformer.prune_kv_mgr = prune_kv_mgr
@@ -640,9 +643,12 @@ DinoVisionTransformer.prune_kv_mgr = prune_kv_mgr
 def retrieve_kv_mgr(self, timing=False, verbose=False, dist_thres=0.1, return_buf=False):
     """Retrieve relevant pivots from the voxel pool."""
     if self.kv_manager is not None and hasattr(self.kv_manager, 'retrieve_kv'):
-        return self.kv_manager.retrieve_kv(
-            timing=timing, verbose=verbose, dist_thres=dist_thres, return_buf=return_buf
+        import time
+        start = time.time()
+        self.kv_manager.retrieve_kv_parallel(
+            verbose=verbose, dist_thres=dist_thres, return_buf=return_buf
         )
+        return (time.time() - start) * 1000 if timing else 0.0
     return 0.0
 
 DinoVisionTransformer.retrieve_kv_mgr = retrieve_kv_mgr
@@ -651,9 +657,15 @@ DinoVisionTransformer.retrieve_kv_mgr = retrieve_kv_mgr
 def update_kv_mgr_pos(self, pts3d, valid_mask, timing=False):
     """Update KV manager positions with 3D points."""
     if self.kv_manager is not None and hasattr(self.kv_manager, 'append_positions'):
-        return self.kv_manager.append_positions(
-            pts_3d=pts3d, valid_mask=valid_mask, timing=timing
+        import time
+        start = time.time()
+        # Flatten: [S, T_per_frame, 3] -> [S*T_per_frame, 3]
+        pts3d = pts3d.view(-1, 3)
+        valid_mask = valid_mask.view(-1).bool()
+        self.kv_manager.append_positions(
+            new_positions=pts3d, new_pos_mask=valid_mask
         )
+        return (time.time() - start) * 1000 if timing else 0.0
     return 0.0
 
 DinoVisionTransformer.update_kv_mgr_pos = update_kv_mgr_pos
@@ -662,7 +674,13 @@ DinoVisionTransformer.update_kv_mgr_pos = update_kv_mgr_pos
 def get_kv_mgr_info(self):
     """Get KV manager information."""
     if self.kv_manager is not None:
-        return self.kv_manager.get_info()
+        info = {}
+        if hasattr(self.kv_manager, 'get_memory_details'):
+            info.update(self.kv_manager.get_memory_details())
+        if hasattr(self.kv_manager, '_offset_hot'):
+            info['kvcache_size'] = [t for t in self.kv_manager._offset_hot]
+            info['kvcache_used'] = sum(self.kv_manager._offset_hot) / 1024 / 1024
+        return info
     return {}
 
 DinoVisionTransformer.get_kv_mgr_info = get_kv_mgr_info

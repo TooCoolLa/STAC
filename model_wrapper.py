@@ -2,6 +2,7 @@ import os
 
 import torch
 import logging
+import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors
 
 root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,6 +17,86 @@ from causalvggt.models.vggt import CausalVGGT
 import sys
 sys.path.insert(0, os.path.join(root_dir, "depth-anything-3", "src"))
 from depth_anything_3.api import DepthAnything3
+
+
+def _compute_global_scale_factor(model, images, device, num_samples=32):
+    """
+    Compute a single global scale factor by sampling frames uniformly.
+
+    Samples `num_samples` frames from the full sequence, runs both the metric
+    and relative DA3 branches, and computes a least-squares scale factor.
+    This ensures all segments share the same metric scale.
+
+    Args:
+        model: DepthAnything3 wrapper
+        images: All input images [S, 3, H, W] on device
+        device: torch device
+        num_samples: Number of frames to sample (default 32)
+
+    Returns:
+        scale_factor: float, or None if computation fails
+    """
+    from depth_anything_3.utils.alignment import (
+        compute_sky_mask, compute_alignment_mask,
+        least_squares_scale_scalar, sample_tensor_for_quantile,
+    )
+
+    S = images.shape[0]
+    if S <= 1:
+        return None
+
+    # Uniform sampling
+    if S <= num_samples:
+        sample_indices = list(range(S))
+    else:
+        sample_indices = [int(i * S / num_samples) for i in range(num_samples)]
+
+    model_net = model.model  # NestedDepthAnything3Net
+    if not hasattr(model_net, 'da3_metric'):
+        return None
+
+    logger.info("Computing global metric scale factor from %d/%d frames...",
+                len(sample_indices), S)
+
+    metric_depths = []
+    rel_depths = []
+    with torch.no_grad():
+        for idx in sample_indices:
+            frame = images[idx:idx+1].unsqueeze(0)  # [1,1,3,H,W]
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                metric_out = model_net.da3_metric(frame)
+                metric_depths.append(metric_out.depth.float())
+
+                rel_out = model_net.da3(frame, streaming=False)
+                rel_depths.append(rel_out.depth.float())
+
+    metric_depth_all = torch.cat(metric_depths, dim=1)  # [1,K,H_m,W_m]
+    rel_depth_all = torch.cat(rel_depths, dim=1)  # [1,K,H_r,W_r]
+
+    # Resize relative to match metric resolution
+    if rel_depth_all.shape[-2:] != metric_depth_all.shape[-2:]:
+        rel_depth_all = F.interpolate(
+            rel_depth_all, size=metric_depth_all.shape[-2:],
+            mode='bilinear', align_corners=False
+        )
+
+    # Non-sky mask
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            frames_sampled = images[sample_indices].unsqueeze(0)  # [1,K,3,H,W]
+            sky_out = model_net.da3_metric(frames_sampled)
+    non_sky_mask = compute_sky_mask(sky_out.sky, threshold=0.3)
+
+    valid_rel = rel_depth_all[non_sky_mask]
+    valid_metric = metric_depth_all[non_sky_mask]
+
+    if valid_rel.numel() < 10:
+        logger.warning("Insufficient valid pixels for global scale computation.")
+        return None
+
+    scale_factor = least_squares_scale_scalar(valid_metric, valid_rel).item()
+    logger.info("Global metric scale factor: %.4f", scale_factor)
+    return scale_factor
 
 ckpt_root = os.path.join(root_dir, 'ckpt')
 
@@ -157,6 +238,14 @@ def run_model(model, images, model_name, mode='full',
             logger.warning("Warning: you are trying to use 'full' attention mode with streaming, which will cause high memory usage.")
         cam_cache_update = kwargs.get("cam_cache_update", False)
         kwargs.pop("cam_cache_update", None)
+
+        # For DA3 nested models, compute a single global scale factor upfront
+        # to ensure consistent metric scale across all segments/frames.
+        if model_name == "da3" and "global_scale_factor" not in kwargs:
+            scale = _compute_global_scale_factor(model, images, device, num_samples=32)
+            if scale is not None:
+                kwargs["global_scale_factor"] = scale
+
         session: StreamSession = stream_sessions.get(model_name, StreamSession)(
             model, device=device, cam_cache_update=cam_cache_update, model_type=model_name)
 
@@ -167,10 +256,10 @@ def run_model(model, images, model_name, mode='full',
         benchmark_metrics = session.get_benchmark()
         total_time = 0
         for k in benchmark_metrics:
-            benchmark_metrics[k] = benchmark_metrics[k] / processed_frames
+            benchmark_metrics[k] = benchmark_metrics[k] / processed_frames if processed_frames > 0 else 0
             total_time += benchmark_metrics[k]
             logger.info(f" Average {k} time per frame: {benchmark_metrics[k]:.2f} ms")
-        logger.info(f"Total average time per frame: {total_time:.2f} ms, FPS: {1000/total_time:.1f} ")
+        logger.info(f"Total average time per frame: {total_time:.2f} ms, FPS: {1000/total_time:.1f} " if total_time > 0 else "Total average time per frame: 0.00 ms, FPS: 0.0 ")
         benchmark_metrics["infer_fps"] = 1000.0 / total_time if total_time > 0 else 0
         predictions["timing"] = benchmark_metrics
         predictions["merger"] = session.get_stats()

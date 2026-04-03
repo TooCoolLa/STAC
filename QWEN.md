@@ -267,3 +267,31 @@ data/<dataset>/<scene>/images/*.png
 - **上下文管理**: 推理使用 `torch.no_grad()` + `torch.amp.autocast()` 包裹
 - **配置传递**: 通过 `**kwargs` 传递 STAC 参数, 在 `run_model()` 中做默认值填充
 - **多骨干适配**: 使用 `model_type` 参数在 `StreamSession` 中分发到不同代码路径
+
+## DA3 集成关键要点 (2026-04-03 修复记录)
+
+### DA3 模型结构差异
+- `NestedDepthAnything3Net` 的 backbone 路径: `model.model.da3.backbone.pretrained`（非 `model.model.backbone.pretrained`）
+- DA3 forward 参数: `image=` 而非 `images=`，不接受 `camera_head_kv_cache_list` / `is_anchor_exist`
+- DA3 输出 Dict 是 `addict.Dict`，键值通过属性访问（`output.extrinsics`），`.get()` 可能返回 None
+- DA3 没有 `camera_head` 和 `point_head`，pose 由 `cam_dec` 直接输出
+
+### DA3 位姿累积（关键修复）
+DA3 每个 chunk 独立推理，输出相对位姿。必须跨 chunk 累积：
+- 使用 `_accumulate_da3_poses()` 方法，通过 c2w 矩阵复合实现
+- 第一个 chunk 直接使用，后续 chunk 计算相对变换后与上一个 chunk 末帧 c2w 复合
+- **必须同时更新 `outputs["pose_enc"]`**，否则 `pushback_prediction` 保存的是旧值
+- 需要在 `_convert_to_stac_format` 中保留 `extrinsics` 和 `intrinsics` 供外部使用
+
+### DA3 计时修复
+- DA3 forward 需要手动添加 CUDA Event 计时（`aggregator_infer_time`）
+- `_convert_to_stac_format` 必须复制 `timing` dict 到 `stac_output`
+- 修复前 FPS 报告 1224（虚高），修复后 25.2（真实值）
+
+### 常见陷阱
+1. **`.get()` vs `getattr()`**: DA3 的 `addict.Dict` 输出需要用 `getattr(output, "key", None)` 访问
+2. **bfloat16 → numpy**: 必须 `.cpu().float().numpy()`，不能直接 `.cpu().numpy()`
+3. **patch_size tuple**: DA3 的 `patch_size` 是 `(14, 14)`，需要取 `[0]`
+4. **KV manager 方法签名**: DA3 的 `update_kv_mgr_pos` 需要 flatten `[S, T_per_frame, 3]` → `[S*T_per_frame, 3]`
+5. **`prune_kv`/`retrieve_kv` 不接受 `timing`**: 需要在 wrapper 中手动计时
+6. **xformers SwiGLU 版本不匹配**: 添加运行时检测，失败时回退到纯 PyTorch 实现

@@ -106,6 +106,9 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        mode: str = "full",
+        streaming: bool = False,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the model.
@@ -114,10 +117,13 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             image: Input batch with shape ``(B, N, 3, H, W)`` on the model device.
             extrinsics: Optional camera extrinsics with shape ``(B, N, 4, 4)``.
             intrinsics: Optional camera intrinsics with shape ``(B, N, 3, 3)``.
-            export_feat_layers: Layer indices to return intermediate features for.
+            export_feat_layers: List of layer indices to return intermediate features for.
             infer_gs: Enable Gaussian Splatting branch.
             use_ray_pose: Use ray-based pose estimation instead of camera decoder.
             ref_view_strategy: Strategy for selecting reference view from multiple views.
+            mode: Attention mode (for STAC compatibility).
+            streaming: Enable streaming mode (for STAC compatibility).
+            **kwargs: Additional arguments (for STAC KV cache management).
 
         Returns:
             Dictionary containing model predictions
@@ -127,7 +133,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         with torch.no_grad():
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
                 return self.model(
-                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy,
+                    mode=mode, streaming=streaming, **kwargs
                 )
 
     def inference(

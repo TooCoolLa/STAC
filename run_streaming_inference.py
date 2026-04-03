@@ -81,8 +81,8 @@ def parse_args():
         "--base_model",
         type=str,
         default="stream3r",
-        choices=["stream3r", "streamvggt", "da3-small", "da3-base", 
-                 "da3-large", "da3-large-1.1", "da3-giant"],
+        choices=["stream3r", "streamvggt", "da3-small", "da3-base",
+                 "da3-large", "da3-large-1.1", "da3-giant", "da3nested-giant-large"],
         help="骨干模型"
     )
     parser.add_argument(
@@ -267,6 +267,7 @@ def run_inference(args, device, dtype):
         "voxel_backend": args.voxel_backend,
         "allocator": "segment",
         "timing": True,
+        "pinned_frame_indices": [0],
     }
     
     print(f"\n⚙️  STAC Configuration:")
@@ -375,7 +376,7 @@ def save_numpy_results(predictions, args, output_dir):
     if "depth" in predictions:
         depth = predictions["depth"]
         if isinstance(depth, torch.Tensor):
-            depth = depth.cpu().numpy()
+            depth = depth.cpu().float().numpy()
         np.save(os.path.join(results_dir, "depth.npy"), depth)
         print(f"   ✓ depth.npy ({depth.shape})")
     
@@ -383,35 +384,35 @@ def save_numpy_results(predictions, args, output_dir):
     if "depth_conf" in predictions:
         depth_conf = predictions["depth_conf"]
         if isinstance(depth_conf, torch.Tensor):
-            depth_conf = depth_conf.cpu().numpy()
+            depth_conf = depth_conf.cpu().float().numpy()
         np.save(os.path.join(results_dir, "depth_conf.npy"), depth_conf)
     
     # 位姿编码
     if "pose_enc" in predictions:
         pose_enc = predictions["pose_enc"]
         if isinstance(pose_enc, torch.Tensor):
-            pose_enc = pose_enc.cpu().numpy()
+            pose_enc = pose_enc.cpu().float().numpy()
         np.save(os.path.join(results_dir, "pose_enc.npy"), pose_enc)
     
     # 外参
     if "extrinsic" in predictions:
         extrinsic = predictions["extrinsic"]
         if isinstance(extrinsic, torch.Tensor):
-            extrinsic = extrinsic.cpu().numpy()
+            extrinsic = extrinsic.cpu().float().numpy()
         np.save(os.path.join(results_dir, "extrinsic.npy"), extrinsic)
     
     # 内参
     if "intrinsic" in predictions:
         intrinsic = predictions["intrinsic"]
         if isinstance(intrinsic, torch.Tensor):
-            intrinsic = intrinsic.cpu().numpy()
+            intrinsic = intrinsic.cpu().float().numpy()
         np.save(os.path.join(results_dir, "intrinsic.npy"), intrinsic)
     
     # 世界坐标点
     if "world_points" in predictions:
         world_points = predictions["world_points"]
         if isinstance(world_points, torch.Tensor):
-            world_points = world_points.cpu().numpy()
+            world_points = world_points.cpu().float().numpy()
         np.save(os.path.join(results_dir, "world_points.npy"), world_points)
 
 

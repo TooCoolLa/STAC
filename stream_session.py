@@ -78,7 +78,13 @@ class StreamSession:
 
         if model_type == "da3":
             # DA3 uses backbone as the aggregator
-            self.aggregator = model.model.backbone.pretrained
+            # NestedDepthAnything3Net has da3.da3.backbone.pretrained
+            if hasattr(model.model, 'da3'):
+                self.aggregator = model.model.da3.backbone.pretrained
+            elif hasattr(model.model, 'backbone'):
+                self.aggregator = model.model.backbone.pretrained
+            else:
+                raise AttributeError(f"Cannot find backbone in DA3 model: {type(model.model).__name__}")
         else:
             # CausalVGGT uses dedicated aggregator
             self.aggregator = model.aggregator
@@ -88,18 +94,23 @@ class StreamSession:
         self.camera_head_iterations = 4 if hasattr(model, 'camera_head') and model.camera_head is not None else 0
         self.cam_cache_update = cam_cache_update
         self.pose_tokens_list = []
+        # DA3 pose accumulation: track last global w2c transformation
+        self._da3_last_c2w = None  # [1, 1, 4, 4] c2w matrix for pose accumulation
         # Prediction keys to track, where the element of prediction shape like [B, S, ...]
         self.predictions_keys = ["pose_enc", "world_points", "world_points_conf", "depth", "depth_conf", "images"]
 
         self._processed_frames = 0
+        self._global_scale_factor = None  # Pre-computed global metric scale factor
         self.init()
 
     def init(self):
         self._processed_frames = 0
+        self._global_scale_factor = None
         self.predictions = {k: [] for k in self.predictions_keys}
         self.pose_tokens_list = []
         self.benchmark_metrics = {}
         self.stats = {}
+        self._da3_last_c2w = None
 
     def clear(self):
         self._clear_predictions()
@@ -145,10 +156,12 @@ class StreamSession:
                 if isinstance(self.predictions[key], torch.Tensor):
                     all_predictions[key] = self.predictions[key].to(device=device)
                     continue
+                if len(self.predictions[key]) == 0:
+                    continue
                 if self._processed_frames != len(self.predictions[key]):
                     raise ValueError(f"Processed frames {self._processed_frames} != stored predictions {len(self.predictions[key])} for key {key}")
                 if isinstance(self.predictions[key][0], torch.Tensor):
-                    all_predictions[key] = torch.cat(self.predictions[key], dim=1)
+                    all_predictions[key] = torch.cat(self.predictions[key], dim=1).to(device=device)
                 elif isinstance(self.predictions[key][0], list):
                     prediction_list = []
                     for layer_idx in range(len(self.predictions[key][0])):
@@ -159,6 +172,12 @@ class StreamSession:
                     all_predictions[key] = prediction_list # list of tensors
                 else:
                     raise ValueError(f"Unsupported prediction type for key {key}: {type(self.predictions[key][0])}")
+        # Include auxiliary keys not in predictions_keys
+        for key in ("is_metric", "scale_factor"):
+            if key in self.predictions and len(self.predictions[key]) > 0:
+                val = self.predictions[key][0]
+                if isinstance(val, torch.Tensor):
+                    all_predictions[key] = val.item() if val.numel() == 1 else val.to(device=device)
         return all_predictions
 
     def get_last_prediction(self):
@@ -194,6 +213,149 @@ class StreamSession:
     
     def get_stats(self):
         return self.stats
+
+    def apply_global_metric_alignment(self, sample_stride=8):
+        """
+        Apply post-hoc global metric alignment to accumulated predictions.
+
+        For DA3 nested models in streaming mode, the per-chunk metric alignment
+        is skipped. This method applies a pre-computed global scale factor
+        (passed via kwargs) to all depth/world_points/extrinsics.
+
+        If no pre-computed scale is available, falls back to computing one
+        from a subset of frames (for backward compatibility).
+
+        Args:
+            sample_stride: Sample every N frames for metric branch inference (fallback only)
+        """
+        if self.model_type != "da3":
+            return
+
+        # Check if model is NestedDepthAnything3Net (has da3_metric branch)
+        model_net = self.model.model if hasattr(self.model, 'model') else self.model
+        if not hasattr(model_net, 'da3_metric'):
+            return
+
+        # Check for pre-computed global scale factor (computed in run_model before pipeline)
+        global_scale = getattr(self, '_global_scale_factor', None)
+
+        if global_scale is not None and global_scale > 0:
+            logger.info("Applying pre-computed global metric scale factor: %.4f", global_scale)
+            self._apply_scale_to_predictions(global_scale)
+            device = self.device
+            self.predictions["is_metric"] = [torch.tensor(1, device=device)]
+            self.predictions["scale_factor"] = [torch.tensor(global_scale, device=device)]
+            return
+
+        # Fallback: compute scale from sampled frames (original behavior)
+        depth_list = self.predictions.get("depth", [])
+        images_list = self.predictions.get("images", [])
+        if not depth_list or not images_list:
+            return
+
+        num_frames = len(depth_list)
+        sample_indices = list(range(0, num_frames, sample_stride))
+        if not sample_indices:
+            sample_indices = [0]
+
+        device = self.device
+        sampled_depths = []
+        sampled_images = []
+        for idx in sample_indices:
+            sampled_depths.append(depth_list[idx].to(device))
+            sampled_images.append(images_list[idx].to(device))
+
+        depth_sampled = torch.cat(sampled_depths, dim=1)
+        images_sampled = torch.cat(sampled_images, dim=1)
+        del sampled_depths, sampled_images
+        torch.cuda.empty_cache()
+
+        if depth_sampled is None or images_sampled is None:
+            return
+
+        logger.info("Computing metric alignment from %d/%d frames (fallback)...",
+                     len(sample_indices), num_frames)
+
+        import torch.nn.functional as F
+        from depth_anything_3.utils.alignment import (
+            compute_sky_mask, compute_alignment_mask,
+            least_squares_scale_scalar, sample_tensor_for_quantile,
+        )
+
+        metric_depths = []
+        rel_depths = []
+        with torch.no_grad():
+            for idx in range(len(sample_indices)):
+                frame = images_sampled[:, idx:idx+1]
+                with torch.autocast(device_type=frame.device.type, dtype=torch.bfloat16):
+                    metric_out = model_net.da3_metric(frame)
+                    metric_depths.append(metric_out.depth.float())
+                    rel_out = model_net.da3(frame, streaming=False)
+                    rel_depths.append(rel_out.depth.float())
+
+        metric_depth_all = torch.cat(metric_depths, dim=1)
+        rel_depth_all = torch.cat(rel_depths, dim=1)
+
+        if rel_depth_all.shape[-2:] != metric_depth_all.shape[-2:]:
+            rel_depth_all = F.interpolate(
+                rel_depth_all, size=metric_depth_all.shape[-2:],
+                mode='bilinear', align_corners=False
+            )
+
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                sky_out = model_net.da3_metric(images_sampled)
+        non_sky_mask = compute_sky_mask(sky_out.sky, threshold=0.3)
+
+        depth_conf_list = self.predictions.get("depth_conf", [])
+        if depth_conf_list and len(depth_conf_list) > 0:
+            conf_sampled = torch.cat([depth_conf_list[i].to(device) for i in sample_indices], dim=1)
+            if len(conf_sampled.shape) == 5:
+                conf_sampled = conf_sampled.squeeze(-1)
+            conf_sampled_flat = conf_sampled[non_sky_mask]
+            conf_sampled_flat = sample_tensor_for_quantile(conf_sampled_flat, max_samples=100000)
+            median_conf = torch.quantile(conf_sampled_flat, 0.5)
+        else:
+            median_conf = 0.5
+
+        align_mask = compute_alignment_mask(
+            depth_conf=conf_sampled if depth_conf_list else torch.ones_like(rel_depth_all),
+            non_sky_mask=non_sky_mask,
+            depth=rel_depth_all,
+            metric_depth=metric_depth_all,
+            median_conf=median_conf,
+        )
+
+        valid_rel = rel_depth_all[align_mask]
+        valid_metric = metric_depth_all[align_mask]
+
+        del metric_depths, rel_depths, metric_depth_all, rel_depth_all
+        del depth_sampled, images_sampled
+        torch.cuda.empty_cache()
+
+        if valid_rel.numel() < 10:
+            logger.info("Global metric alignment skipped (insufficient valid pixels).")
+            self.predictions["is_metric"] = [torch.tensor(0, device=device)]
+            return
+
+        scale_factor = least_squares_scale_scalar(valid_metric, valid_rel).item()
+        logger.info("Fallback global metric alignment applied. scale_factor=%.4f", scale_factor)
+        self._apply_scale_to_predictions(scale_factor)
+        self.predictions["is_metric"] = [torch.tensor(1, device=device)]
+        self.predictions["scale_factor"] = [torch.tensor(scale_factor, device=device)]
+
+    def _apply_scale_to_predictions(self, scale_factor):
+        """Apply a scale factor to all depth/world_points/extrinsics predictions."""
+        device = self.device
+        for key in self.predictions:
+            if key not in ("depth", "world_points", "extrinsics"):
+                continue
+            pred_list = self.predictions[key]
+            if not pred_list:
+                continue
+            for i in range(len(pred_list)):
+                if isinstance(pred_list[i], torch.Tensor):
+                    pred_list[i] = (pred_list[i].to(device) * scale_factor).cpu()
 
 
     # ======== Inference methods ========
@@ -248,7 +410,10 @@ class StreamSession:
         pts3d = pts3d.permute(0, 1, 4, 2, 3).view(-1, C, H, W) # [S, 3, H, W]
         pts3d_conf = pts3d_conf.permute(0, 1, 4, 2, 3).view(-1, 1, H, W) # [S, 1, H, W]
         # downsample to patch level
-        ds_patch = self.model.point_head.patch_size
+        if self.model_type == "da3":
+            ds_patch = 14  # DA3 ViT patch size
+        else:
+            ds_patch = self.model.point_head.patch_size
         ds_size = (max(1, H // ds_patch), max(1, W // ds_patch))
         pts3d = torch.nn.functional.interpolate(
             pts3d, size=ds_size, mode='bilinear', align_corners=False
@@ -268,6 +433,117 @@ class StreamSession:
         valid_mask = torch.cat((valid_special, valid_mask), dim=1) # [S, special+H'*W']
         return pts3d, valid_mask
 
+    def _accumulate_da3_poses(self, pose_enc, outputs, frame_idx, chunk_size):
+        """Accumulate DA3 poses globally across chunks.
+        
+        DA3 outputs relative extrinsics per chunk (each chunk is in its own coordinate system).
+        We need to convert to global coordinates by composing with the previous chunk's last pose.
+        
+        Args:
+            pose_enc: [B, N, 9] pose encoding
+            outputs: model output dict containing extrinsics [B, N, 3, 4] w2c
+            frame_idx: current global frame index
+            chunk_size: number of frames in this chunk
+            
+        Returns:
+            Updated pose_enc and outputs with globally accumulated poses
+        """
+        import torch
+        
+        extrinsics_w2c = outputs.get("extrinsics", None)
+        if extrinsics_w2c is None:
+            extrinsics_w2c = getattr(outputs, "extrinsics", None)
+        if extrinsics_w2c is None:
+            return pose_enc, outputs
+        
+        B, N = extrinsics_w2c.shape[0], extrinsics_w2c.shape[1]
+        
+        # Convert w2c [B, N, 3, 4] to homogeneous [B, N, 4, 4]
+        ones = torch.zeros(B, N, 1, 4, device=extrinsics_w2c.device, dtype=extrinsics_w2c.dtype)
+        ones[:, :, 0, 3] = 1.0
+        w2c_homo = torch.cat([extrinsics_w2c, ones], dim=2)  # [B, N, 4, 4]
+        
+        # Invert to get c2w
+        c2w_homo = self._invert_pose(w2c_homo)  # [B, N, 4, 4]
+        
+        if self._da3_last_c2w is None:
+            # First chunk: poses are already global (relative to first frame)
+            self._da3_last_c2w = c2w_homo[:, -1:, :, :].detach()  # Save last c2w
+        else:
+            # Subsequent chunks: compose with previous chunk's last pose
+            # Current chunk's first frame c2w (relative)
+            first_c2w_rel = c2w_homo[:, :1, :, :]  # [B, 1, 4, 4]
+            # Previous chunk's last frame c2w (global)
+            last_c2w_global = self._da3_last_c2w  # [B, 1, 4, 4]
+            
+            # Compute transformation: T_global = T_prev_last @ T_rel @ T_rel_first_inv
+            # Simpler: compute relative transform from chunk's first frame to each frame,
+            # then apply to global first frame
+            
+            # Relative transform from frame 0 to frame i in current chunk:
+            # T_rel_0_to_i = c2w_rel[i] @ inv(c2w_rel[0])
+            first_c2w_inv = self._invert_pose(first_c2w_rel)  # [B, 1, 4, 4]
+            
+            # Global first frame c2w: use last_c2w_global as reference
+            # Actually, we need the global pose of the first frame in this chunk
+            # which should be the continuation from the previous chunk's last frame
+            # But DA3 doesn't give us that directly.
+            
+            # Approach: compute relative motion within chunk, then accumulate
+            # For frame i in chunk: T_global[i] = T_global[first-1] @ T_rel[0->i]
+            # where T_rel[0->i] = c2w[i] @ inv(c2w[0])
+            
+            # Get global pose of frame just before this chunk
+            prev_global_c2w = self._da3_last_c2w  # [B, 1, 4, 4]
+            
+            # Compute relative transforms within chunk (relative to first frame)
+            rel_transforms = torch.matmul(c2w_homo, first_c2w_inv.expand(-1, N, -1, -1))  # [B, N, 4, 4]
+            
+            # Apply to previous global pose
+            global_c2w = torch.matmul(prev_global_c2w.expand(-1, N, -1, -1), rel_transforms)  # [B, N, 4, 4]
+            
+            # Convert back to w2c
+            global_w2c = self._invert_pose(global_c2w)  # [B, N, 4, 4]
+            global_w2c_3x4 = global_w2c[:, :, :3, :]  # [B, N, 3, 4]
+            
+            # Update outputs
+            outputs["extrinsics"] = global_w2c_3x4
+            
+            # Re-encode pose
+            pose_enc = self._encode_pose_from_extrinsics(global_w2c_3x4)
+            outputs["pose_enc"] = pose_enc  # Also update outputs so pushback saves correct pose
+            
+            # Update last global c2w
+            self._da3_last_c2w = global_c2w[:, -1:, :, :].detach()
+        
+        return pose_enc, outputs
+    
+    def _invert_pose(self, w2c):
+        """Invert w2c [B, N, 4, 4] to c2w [B, N, 4, 4]."""
+        import torch
+        R = w2c[:, :, :3, :3]  # [B, N, 3, 3]
+        t = w2c[:, :, :3, 3:]  # [B, N, 3, 1]
+        R_inv = R.transpose(-2, -1)  # [B, N, 3, 3]
+        t_inv = -torch.matmul(R_inv, t)  # [B, N, 3, 1]
+        c2w = torch.eye(4, device=w2c.device, dtype=w2c.dtype).unsqueeze(0).unsqueeze(0).expand(
+            w2c.shape[0], w2c.shape[1], -1, -1
+        ).clone()
+        c2w[:, :, :3, :3] = R_inv
+        c2w[:, :, :3, 3:] = t_inv
+        return c2w
+    
+    def _encode_pose_from_extrinsics(self, extrinsics):
+        """Encode extrinsics [B, N, 3, 4] w2c to pose_enc [B, N, 9]."""
+        import torch
+        B, N = extrinsics.shape[0], extrinsics.shape[1]
+        R = extrinsics[:, :, :3, :3]  # [B, N, 3, 3]
+        t = extrinsics[:, :, :3, 3:]  # [B, N, 3, 1]
+        pose_enc = torch.cat([
+            R[:, :, :2, :].reshape(B, N, 6),
+            t.reshape(B, N, 3)
+        ], dim=-1)
+        return pose_enc
+
     def pipeline(self, 
                  images: torch.Tensor, 
                  mode="causal", 
@@ -278,15 +554,28 @@ class StreamSession:
         num_frames = images.shape[0]
         device = kwargs.get("device", self.device)
         dtype = kwargs.get("dtype", torch.float16)
+
+        # Accept pre-computed global scale factor from run_model
+        self._global_scale_factor = kwargs.get("global_scale_factor", None)
+        if self._global_scale_factor is not None:
+            logger.info("Using pre-computed global scale factor: %.4f", self._global_scale_factor)
+
         logger.info("Streaming Pipeline Warming up the model...")
         for _ in range(1):
-            self.model(
-                images=images[0:1].to(device=device, dtype=dtype),
-                mode="full",
-                camera_head_kv_cache_list=None,
-                streaming=True,
-                is_anchor_exist=True,
-            )  # warmup
+            if self.model_type == "da3":
+                self.model(
+                    image=images[0:1].to(device=device, dtype=dtype),
+                    mode="full",
+                    streaming=True,
+                )
+            else:
+                self.model(
+                    images=images[0:1].to(device=device, dtype=dtype),
+                    mode="full",
+                    camera_head_kv_cache_list=None,
+                    streaming=True,
+                    is_anchor_exist=True,
+                )  # warmup
 
         if mode in ["window_kv","causal"]:
             # Use H2O attention to maintain a heavy-hitter + recent KV cache for the aggregator.
@@ -319,7 +608,7 @@ class StreamSession:
             })
             kv_kwargs = self.register_kv_mgr(mode, images, KVManager, **kv_kwargs)
             if self.model_type == "da3":
-                self.model.model.backbone.pretrained.set_camhead(self.cam_cache_update)
+                self.aggregator.set_camhead(self.cam_cache_update)
             else:
                 self.model.set_camhead(self.cam_cache_update)
             debug_timing = kwargs.get("timing", True)
@@ -340,11 +629,9 @@ class StreamSession:
                         frame_buffer = transfer_chunk[local_offset:local_end]
                         frame_buffer_size = frame_buffer.shape[0]
                         outputs = self.model(
-                            images=frame_buffer,
+                            image=frame_buffer,
                             mode="full",
-                            camera_head_kv_cache_list=None,
                             streaming=True,
-                            is_anchor_exist=frame_idx == 0,
                             timing=debug_timing,
                         )
                         timing = outputs.get("timing", {})
@@ -359,7 +646,7 @@ class StreamSession:
 
                         kvcache_info = (self.model.aggregator.get_kv_mgr_info()
                                         if hasattr(self.model, 'aggregator')
-                                        else self.model.model.backbone.pretrained.get_kv_mgr_info())
+                                        else self.aggregator.get_kv_mgr_info())
                         kvcache_size = kvcache_info["kvcache_size"][0]
                         kvcache_mem = kvcache_info["kvcache_used"]
                         # When CPU offload is active, show total (gpu+cpu) so stats reflect full context
@@ -390,7 +677,7 @@ class StreamSession:
                 logger.info("Window mode done.")
             # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
             if self.model_type == "da3":
-                kv_mgr = self.model.model.backbone.pretrained.kv_manager
+                kv_mgr = self.aggregator.kv_manager
             else:
                 kv_mgr = self.model.aggregator.kv_manager
             if kv_mgr is not None:
@@ -441,7 +728,7 @@ class StreamSession:
             kv_kwargs.update(merger_kwargs)
             kv_kwargs = self.register_kv_mgr(mode, images, STACVoxelKV, **kv_kwargs)
             if self.model_type == "da3":
-                kv_manager = self.model.model.backbone.pretrained.kv_manager
+                kv_manager = self.aggregator.kv_manager
             else:
                 kv_manager = self.model.aggregator.kv_manager
 
@@ -466,7 +753,7 @@ class StreamSession:
                         chunk_size, transfer_chunk_size, window_size, conf_threshold)
             special_tokens_size = (self.model.aggregator.patch_start_idx
                                    if hasattr(self.model, 'aggregator')
-                                   else self.model.model.backbone.pretrained.patch_start_idx)
+                                   else self.aggregator.patch_start_idx)
             
             progress, task = _make_progress("STAC Mode", num_frames)
             with Live(progress, console=_console, refresh_per_second=8) as live:
@@ -483,15 +770,20 @@ class StreamSession:
                         frame_buffer = transfer_chunk[local_offset:local_end]
                         frame_buffer_size = frame_buffer.shape[0]
                         outputs = self.model(
-                            images=frame_buffer,
+                            image=frame_buffer,
                             mode="full",
-                            camera_head_kv_cache_list=None,
                             streaming=True,
-                            is_anchor_exist=frame_idx==0,
                             timing=debug_timing,
                         )
                         timing = outputs.get("timing", {})
-                        if not self.cam_cache_update and self.model.camera_head is not None:
+                        if self.model_type == "da3":
+                            pose_enc = outputs["pose_enc"]
+                            # Accumulate DA3 poses globally across chunks
+                            # DA3 outputs relative extrinsics per chunk; we need global poses
+                            pose_enc, outputs = self._accumulate_da3_poses(
+                                pose_enc, outputs, frame_idx, frame_buffer_size
+                            )
+                        elif not self.cam_cache_update and self.model.camera_head is not None:
                             cam_output = self.camera_head_inference(outputs["aggregated_tokens_list"])
                             pose_enc = cam_output["pose_enc"]
                         else:
@@ -502,7 +794,7 @@ class StreamSession:
                                                               pose_enc = pose_enc, images=frame_buffer
                                                               )
                         if self.model_type == "da3":
-                            kv_pos_time = self.model.model.backbone.pretrained.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
+                            kv_pos_time = self.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
                         else:
                             kv_pos_time = self.model.aggregator.update_kv_mgr_pos(pts3d, valid_mask, timing=debug_timing)
                         timing["kv_position_time"] = kv_pos_time
@@ -513,7 +805,7 @@ class StreamSession:
                                 chunks_per_window = max(1, window_size // chunk_size)
                                 if (frame_idx // chunk_size + 1) % chunks_per_window == 0:
                                     if self.model_type == "da3":
-                                        retrieval_time = self.model.model.backbone.pretrained.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                        retrieval_time = self.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
                                                                                            dist_thres=dist_thres,
                                                                                            return_buf=kwargs.get("return_buf", False))
                                     else:
@@ -522,7 +814,7 @@ class StreamSession:
                                                                                            return_buf=kwargs.get("return_buf", False))
                             elif ret_size == -1:
                                 if self.model_type == "da3":
-                                    retrieval_time = self.model.model.backbone.pretrained.retrieve_kv_mgr(timing=debug_timing, verbose=False,
+                                    retrieval_time = self.aggregator.retrieve_kv_mgr(timing=debug_timing, verbose=False,
                                                                                        dist_thres=dist_thres,
                                                                                        return_buf=kwargs.get("return_buf", False))
                                 else:
@@ -534,7 +826,7 @@ class StreamSession:
 
                         evict_merge_time = 0.0
                         if self.model_type == "da3":
-                            evict_merge_time = self.model.model.backbone.pretrained.prune_kv_mgr(timing=debug_timing)
+                            evict_merge_time = self.aggregator.prune_kv_mgr(timing=debug_timing)
                         else:
                             evict_merge_time = self.model.aggregator.prune_kv_mgr(timing=debug_timing)
                         timing["kv_evict_merge_time"] = evict_merge_time
@@ -565,7 +857,7 @@ class StreamSession:
 
                         kvcache_info = (self.model.aggregator.get_kv_mgr_info()
                                         if hasattr(self.model, 'aggregator')
-                                        else self.model.model.backbone.pretrained.get_kv_mgr_info())
+                                        else self.aggregator.get_kv_mgr_info())
                         merger_stat = kv_manager.get_merger_info()
                         merger_stat["frame_idx"] = frame_idx
                         total_time = 0.0
@@ -606,7 +898,7 @@ class StreamSession:
 
             # Token stats are not meaningful for our kv_manager; keep Token empty. Persist Memory(MB) for eval/compare.
             if self.model_type == "da3":
-                kv_mgr = self.model.model.backbone.pretrained.kv_manager
+                kv_mgr = self.aggregator.kv_manager
             else:
                 kv_mgr = self.model.aggregator.kv_manager
             if kv_mgr is not None:
@@ -614,6 +906,10 @@ class StreamSession:
                 if hasattr(kv_mgr, "get_memory_details"):
                     metrics["Memory(MB)"] = kv_mgr.get_memory_details()
                 self.stats = metrics
+
+        # Post-hoc global metric alignment for DA3 nested models
+        if self.model_type == "da3":
+            self.apply_global_metric_alignment()
 
     def register_kv_mgr(self, mode,
                             images, 
@@ -650,17 +946,24 @@ class StreamSession:
             else:
                 B, S, C, H, W = images.shape
                 assert B == 1, "Batch size must be 1 when input is 5D."
-            vit_patch_size = self.model.aggregator.patch_embed.patch_size
+            if self.model_type == "da3":
+                vit_patch_size = self.aggregator.patch_embed.patch_size
+                cam_tokens = self.aggregator.patch_start_idx
+            else:
+                vit_patch_size = self.model.aggregator.patch_embed.patch_size
+                cam_tokens = self.model.aggregator.patch_start_idx
+            if isinstance(vit_patch_size, (list, tuple)):
+                vit_patch_size = vit_patch_size[0]
             img_tokens = (H // vit_patch_size) * (W // vit_patch_size)
-            cam_tokens = self.model.aggregator.patch_start_idx
             token_per_frame = img_tokens + cam_tokens
 
             kwargs_kv.update({
                 "token_per_frame": token_per_frame,
                 "buffer_size": buffer_size,
             })
-            self.model.aggregator.register_kv_mgr(kv_manager=kv_manager,
-                                                **kwargs_kv
-                                                )
+            if self.model_type == "da3":
+                self.aggregator.register_kv_mgr(kv_manager, **kwargs_kv)
+            else:
+                self.model.aggregator.register_kv_mgr(kv_manager, **kwargs_kv)
 
             return kwargs_kv

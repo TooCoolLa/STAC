@@ -129,6 +129,12 @@ class DepthAnything3Net(nn.Module):
         Returns:
             Dictionary containing predictions and auxiliary features
         """
+        debug_timing = kwargs.get("timing", False)
+        if debug_timing:
+            time_start = torch.cuda.Event(enable_timing=True)
+            time_end = torch.cuda.Event(enable_timing=True)
+            time_start.record()
+        
         # Handle input shape: [S, 3, H, W] -> [B, N, 3, H, W]
         if len(x.shape) == 4:
             x = x.unsqueeze(0)  # Add batch dimension: [S, 3, H, W] -> [1, S, 3, H, W]
@@ -165,8 +171,13 @@ class DepthAnything3Net(nn.Module):
         output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
 
         # Add timing if requested
-        if kwargs.get("timing", False):
-            output["timing"] = {"aggregator_infer_time": 0.0}
+        if debug_timing:
+            time_end.record()
+            torch.cuda.synchronize()
+            aggregator_time = time_start.elapsed_time(time_end)
+            if "timing" not in output:
+                output["timing"] = {}
+            output["timing"]["aggregator_infer_time"] = aggregator_time
 
         # Convert to STAC-compatible format
         if streaming:
@@ -209,23 +220,23 @@ class DepthAnything3Net(nn.Module):
         # Convert extrinsics to pose_enc
         # DA3 extrinsics: [B, N, 3, 4] w2c format
         # STAC needs pose_enc which is a 9D encoding
-        extrinsics = output.get("extrinsics", None)
-        intrinsics = output.get("intrinsics", None)
+        # Note: output is a special Dict where keys are accessed as attributes,
+        # so we use getattr instead of .get()
+        extrinsics = getattr(output, "extrinsics", None)
+        intrinsics = getattr(output, "intrinsics", None)
         
         if extrinsics is not None:
             # Convert w2c to c2w for pose encoding
             c2w = affine_inverse(extrinsics)  # [B, N, 4, 4]
-            # Simple pose encoding: just use rotation + translation
-            # Format: [R(3x3 flattened), t(3)] -> but we only need 9 values
-            # Use simplified encoding: [R(3x3 upper), t(3)] = 9 + 3 = 12 -> take first 9
-            # Actually, let's use the same encoding as pose_encoding_to_extri_intri expects
-            # For now, use a simple encoding
             pose_enc = self._encode_pose_from_extrinsics(extrinsics)
             stac_output["pose_enc"] = pose_enc
+            # Keep extrinsics and intrinsics for external pose accumulation
+            stac_output["extrinsics"] = extrinsics
+            stac_output["intrinsics"] = intrinsics
         
         # Reshape depth to match STAC format
-        depth = output.get("depth", None)
-        depth_conf = output.get("depth_conf", None)
+        depth = getattr(output, "depth", None)
+        depth_conf = getattr(output, "depth_conf", None)
         
         if depth is not None:
             # DA3 depth: [B, N, H, W] -> STAC: [B, N, H, W, 1]
@@ -254,6 +265,10 @@ class DepthAnything3Net(nn.Module):
         # Store aggregated tokens list for camera head inference (if needed)
         # DA3 doesn't have this, so we'll use a placeholder
         stac_output["aggregated_tokens_list"] = [None]
+        
+        # Copy timing dict from original output
+        if "timing" in output:
+            stac_output["timing"] = output["timing"]
         
         return stac_output
 
@@ -485,6 +500,8 @@ class DepthAnything3Net(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Extract auxiliary features from specified layers."""
         aux_features = Dict()
+        if feats is None or feat_layers is None:
+            return aux_features
         assert len(feats) == len(feat_layers)
         for feat, feat_layer in zip(feats, feat_layers):
             # Reshape features to spatial dimensions
@@ -539,6 +556,9 @@ class NestedDepthAnything3Net(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        mode: str = "full",
+        streaming: bool = False,
+        **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through both branches with metric scaling alignment.
@@ -551,14 +571,23 @@ class NestedDepthAnything3Net(nn.Module):
             infer_gs: Enable Gaussian Splatting branch
             use_ray_pose: Use ray-based pose estimation
             ref_view_strategy: Strategy for selecting reference view
+            mode: Attention mode (for STAC compatibility)
+            streaming: Enable streaming mode (for STAC compatibility)
+            **kwargs: Additional arguments (for STAC KV cache management)
 
         Returns:
             Dictionary containing aligned depth predictions and camera parameters
         """
         # Get predictions from both branches
         output = self.da3(
-            x, extrinsics, intrinsics, export_feat_layers=export_feat_layers, infer_gs=infer_gs, use_ray_pose=use_ray_pose, ref_view_strategy=ref_view_strategy
+            x, extrinsics, intrinsics, export_feat_layers=export_feat_layers, infer_gs=infer_gs, use_ray_pose=use_ray_pose, ref_view_strategy=ref_view_strategy,
+            mode=mode, streaming=streaming, **kwargs
         )
+        
+        # In streaming mode, output is already a dict in STAC format
+        if streaming:
+            return output
+        
         metric_output = self.da3_metric(x)
 
         # Apply metric scaling and alignment
@@ -637,3 +666,137 @@ class NestedDepthAnything3Net(nn.Module):
         )
 
         return output
+
+    def align_streaming_output(
+        self,
+        stac_output: Dict[str, torch.Tensor],
+        images: torch.Tensor,
+        sample_stride: int = 8,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Post-hoc global metric alignment for streaming outputs.
+
+        In streaming mode the nested model skips metric alignment (early return).
+        This method runs the metric branch on a subset of frames, computes a global
+        scale factor, and applies it to all depth / world_points / extrinsics in
+        the accumulated streaming output.
+
+        Args:
+            stac_output: Accumulated streaming predictions dict containing
+                         depth [B,S,H,W,1], world_points [B,S,H,W,3],
+                         extrinsics [B,N,3,4] or [B,N,4,4], etc.
+            images: Original input images [B,S,3,H,W] or [S,3,H,W]
+            sample_stride: Sample every N frames for metric branch inference
+
+        Returns:
+            Updated stac_output with metric-aligned depth and extrinsics
+        """
+        import torch.nn.functional as F
+
+        depth = stac_output.get("depth", None)
+        if depth is None:
+            return stac_output
+
+        # Handle image shape
+        if len(images.shape) == 4:
+            images = images.unsqueeze(0)  # [S,3,H,W] -> [1,S,3,H,W]
+        B, S, _, H, W = images.shape
+
+        # Handle depth shape
+        if len(depth.shape) == 4:
+            depth_4d = depth  # [B,S,H,W]
+        elif len(depth.shape) == 5:
+            depth_4d = depth.squeeze(-1)  # [B,S,H,W,1] -> [B,S,H,W]
+        else:
+            return stac_output
+
+        # Sample frames for metric branch
+        sample_indices = list(range(0, S, sample_stride))
+        if not sample_indices:
+            sample_indices = [0]
+
+        # Run metric branch on sampled frames
+        metric_depths = []
+        rel_depths = []
+        device = images.device
+        self.da3_metric.to(device).eval()
+        self.da3.to(device).eval()
+        with torch.no_grad():
+            for idx in sample_indices:
+                frame = images[:, idx:idx+1].to(device)  # [1,1,3,H,W]
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    metric_out = self.da3_metric(frame)
+                    metric_depths.append(metric_out.depth.float())  # [1,1,H,W]
+
+                    # Get relative depth at same resolution
+                    rel_out = self.da3(frame, streaming=False)
+                    rel_depths.append(rel_out.depth.float())  # [1,1,H,W]
+
+        metric_depth_all = torch.cat(metric_depths, dim=1)  # [1,K,H,W]
+        rel_depth_all = torch.cat(rel_depths, dim=1)  # [1,K,H,W]
+
+        # Resize relative depth to match metric depth resolution if needed
+        if rel_depth_all.shape[-2:] != metric_depth_all.shape[-2:]:
+            rel_depth_all = F.interpolate(
+                rel_depth_all, size=metric_depth_all.shape[-2:],
+                mode='bilinear', align_corners=False
+            )
+
+        # Compute non-sky mask
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                sky_out = self.da3_metric(images[:, sample_indices].to(device))
+        non_sky_mask = compute_sky_mask(sky_out.sky, threshold=0.3)  # [1,K,H,W]
+
+        # Compute alignment mask
+        depth_conf = stac_output.get("depth_conf", None)
+        if depth_conf is not None:
+            if len(depth_conf.shape) == 4:
+                conf_4d = depth_conf  # [B,S,H,W]
+            else:
+                conf_4d = depth_conf.squeeze(-1)
+            # Sample confidence at same frame indices
+            conf_sampled = conf_4d[:, sample_indices]  # [B,K,H,W]
+            conf_sampled_flat = conf_sampled[non_sky_mask]
+            conf_sampled_flat = sample_tensor_for_quantile(conf_sampled_flat, max_samples=100000)
+            median_conf = torch.quantile(conf_sampled_flat, 0.5)
+        else:
+            median_conf = 0.5
+
+        align_mask = compute_alignment_mask(
+            depth_conf=conf_sampled if depth_conf is not None else torch.ones_like(rel_depth_all),
+            non_sky_mask=non_sky_mask,
+            depth=rel_depth_all,
+            metric_depth=metric_depth_all,
+            median_conf=median_conf,
+        )
+
+        valid_rel = rel_depth_all[align_mask]
+        valid_metric = metric_depth_all[align_mask]
+
+        if valid_rel.numel() < 10:
+            # Not enough valid pixels, skip alignment
+            stac_output["is_metric"] = 0
+            return stac_output
+
+        scale_factor = least_squares_scale_scalar(valid_metric, valid_rel)
+
+        # Apply scaling to depth
+        stac_output["depth"] = depth * scale_factor
+
+        # Apply scaling to world_points
+        if "world_points" in stac_output:
+            stac_output["world_points"] = stac_output["world_points"] * scale_factor
+
+        # Apply scaling to extrinsics translation component
+        extrinsics = stac_output.get("extrinsics", None)
+        if extrinsics is not None:
+            if extrinsics.shape[-1] == 4:  # [B,N,3,4]
+                extrinsics[:, :, :3, 3] *= scale_factor
+                stac_output["extrinsics"] = extrinsics
+
+        # Mark as metric
+        stac_output["is_metric"] = 1
+        stac_output["scale_factor"] = scale_factor.item()
+
+        return stac_output
